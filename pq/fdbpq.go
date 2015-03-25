@@ -8,20 +8,22 @@
 //     })
 //     return
 // }
-
+// key := p.item.Pack([]tuple.TupleElement{priority})
 package pq
 
 import (
+	"bytes"
 	"errors"
 	"github.com/FoundationDB/fdb-go/fdb"
 	"github.com/FoundationDB/fdb-go/fdb/directory"
 	"github.com/FoundationDB/fdb-go/fdb/subspace"
 	"github.com/FoundationDB/fdb-go/fdb/tuple"
 	"log"
+	"math/rand"
 )
 
 func init() {
-	fdb.MustAPIVersion(300)
+
 }
 
 type PriorityQueue struct {
@@ -63,16 +65,16 @@ func NewPriorityQueue(db fdb.Database, path []string, hc bool) (PriorityQueue, e
 }
 
 // Push adds an item to the queue
-func (p *PriorityQueue) Push(item []byte, priority, randomID int) error {
+func (p *PriorityQueue) Push(priority int, item []byte) error {
+	randomID := rand.Int()
 	_, err := p.db.Transact(func(tr fdb.Transaction) (ret interface{}, e error) {
 		if p.checkAtPriority(tr, item, priority) {
+			// Push already succeeded
 			return nil, nil
 		}
-		key := p.item.Pack([]tuple.TupleElement{priority})
-		nextKey := p.getNextKey(tr.Snapshot(), key)
-		return nil, p.pushAt(tr, item, nextKey, priority, randomID)
+		nextKey := p.mustGetNextKey(tr.Snapshot())
+		return nil, p.pushAt(tr, item, priority, nextKey, randomID)
 	})
-
 	return err
 }
 
@@ -127,17 +129,9 @@ func (p *PriorityQueue) MustPeekLast() []byte {
 // Peek gets the next item without popping
 func (p *PriorityQueue) peek(reverse bool) ([]byte, error) {
 	return interfaceToByteArray(p.db.Transact(func(tr fdb.Transaction) (ret interface{}, e error) {
-		first, err := p.getFirstItem(tr, reverse)
-		if err != nil {
-			return nil, err
-		} else if first != nil {
-			return first, nil
-		}
-		return nil, nil
+		return p.getFirstItem(tr, reverse)
 	}))
 }
-
-//tr fdb.Transactor
 
 // Test if queue is empty
 func (p *PriorityQueue) IsEmpty() (bool, error) {
@@ -165,14 +159,13 @@ func (p *PriorityQueue) MustIsEmpty() bool {
 // Remove all items from queue
 func (p *PriorityQueue) Clear() error {
 	_, err := p.db.Transact(func(tr fdb.Transaction) (ret interface{}, e error) {
-		begin, end := p.subSpace.FDBRangeKeys()
-		tr.ClearRange(fdb.KeyRange{Begin: begin, End: end})
+		tr.ClearRange(keyRange(p.subSpace))
 		return nil, nil
 	})
 	return err
 }
 
-// Remove item from arbitrary index in the queue
+// Remove item from arbitrary position in the queue
 func (p *PriorityQueue) Remove(index int) error {
 	_, err := p.db.Transact(func(tr fdb.Transaction) (ret interface{}, e error) {
 		// TODO
@@ -189,8 +182,8 @@ func (p *PriorityQueue) Remove(index int) error {
 	return err
 }
 
-func (p *PriorityQueue) checkAtPriority(tr fdb.Transaction, item []byte, priority int) bool {
-	p.member.Unpack(k)
+func (p *PriorityQueue) checkAtPriority(tr fdb.Transactor, item []byte, priority int) bool {
+	// p.member.Unpack(k)
 	// TODO
 	// r = self._member[item][priority].range()
 	//        for _ in tr.get_range(r.start, r.stop, limit=1):
@@ -199,42 +192,71 @@ func (p *PriorityQueue) checkAtPriority(tr fdb.Transaction, item []byte, priorit
 	return false
 }
 
-func (p *PriorityQueue) getNextKey(ss fdb.Snapshot, key fdb.Key) int {
-	ss.ReadTransact(func(rt fdb.ReadTransaction) (ret interface{}, e error) {
-		start, end := p.subSpace.FDBRangeKeys()
+func (p *PriorityQueue) getNextKey(ss fdb.Snapshot) (int, error) {
+	lastKey, err := ss.ReadTransact(func(tr fdb.ReadTransaction) (ret interface{}, e error) {
+		_, end := p.subSpace.FDBRangeKeys()
 		sel := fdb.LastLessThan(end)
-		lastKey := tr.GetKey(sel)
-		return lastKey, nil
 
+		key, err := tr.GetKey(sel).Get()
+		if err != nil {
+			return nil, err
+		}
+
+		keySlice := []byte(key)
+		if bytes.Compare(keySlice, []byte(end.FDBKey())) == 1 {
+			tpl, err := p.subSpace.Unpack(key)
+			if err != nil {
+				return nil, err
+			}
+
+			if key, ok := tpl[0].(int); ok {
+				return key + 1, nil
+			}
+		}
+
+		return 0, nil
 	})
 
-	if lastKey >= end {
-		return p.subSpace.Unpack(lastKey) + 1
+	if err != nil {
+		return -1, err
 	}
 
-	return 0
+	if lastKey, ok := lastKey.(int); ok {
+		return lastKey, nil
+	}
+
+	return -1, errors.New("Could not cast key to int")
 }
 
-func (p *PriorityQueue) pushAt(tr fdb.Transaction, item []byte, count, priority, randomID int) error {
-	var key fdb.Key
+func (p *PriorityQueue) mustGetNextKey(ss fdb.Snapshot) int {
+	lastKey, err := p.getNextKey(ss)
+	if err != nil {
+		log.Println(err.Error())
+		return -1
+	}
+	return lastKey
+}
+
+func (p *PriorityQueue) pushAt(tr fdb.Transaction, item []byte, priority, count, randomID int) error {
+	key := p.item.Pack([]tuple.TupleElement{priority, count, randomID})
 	tr.AddReadConflictKey(key)
+	tr.Set(key, item)
 	// TODO
-	// key = self._item[priority][count][random_ID]
-	//        # Protect against the unlikely event that another transaction pushing a
-	//        # an item with the same priority got the same count and random ID.
-	//        tr.add_read_conflict_key(key)
-	//        tr[key] = item
 	//        tr[self._member[self._decode(item)][priority][count]] = ''
 	return nil
 }
 
-func (p *PriorityQueue) getFirstItem(tr fdb.Transaction, reverse bool) ([]byte, error) {
-	// TODO
-	//r = self._item.range()
-	//       for kv in tr.get_range(r.start, r.stop, limit=1, reverse=max):
-	//           return kv
-	//       return None
-	return nil, nil
+func (p *PriorityQueue) getFirstItem(tr fdb.Transactor, reverse bool) ([]byte, error) {
+	return interfaceToByteArray(tr.ReadTransact(func(rt fdb.ReadTransaction) (ret interface{}, e error) {
+		kr := keyRange(p.item)
+		resSlice, err := rt.GetRange(kr, fdb.RangeOptions{Limit: 1, Reverse: reverse}).GetSliceWithError()
+
+		if len(resSlice) > 0 {
+			return resSlice[1], err
+		}
+
+		return nil, err
+	}))
 }
 
 func (p *PriorityQueue) popLowContention(reverse bool) ([]byte, error) {
@@ -283,42 +305,65 @@ func (p *PriorityQueue) addPopRequest(forced bool) (fdb.Key, error) {
 	return nil, nil
 }
 
+// Retrieve and process a batch of requests and a batch of items.
+// We initially attempt to retrieve equally sized batches of each. However,
+// the number of outstanding requests need not match the number of
+// available items; either could be larger than the other. We therefore
+// only process a number equal to the smaller of the two.
 func (p *PriorityQueue) fulfillRequestedPops(reverse bool) error {
 	// TODO
-	// ''' Retrieve and process a batch of requests and a batch of items.
 
-	//        We initially attempt to retrieve equally sized batches of each. However,
-	//        the number of outstanding requests need not match the number of
-	//        available items; either could be larger than the other. We therefore
-	//        only process a number equal to the smaller of the two.
-	//        '''
-	//        batch = 100
+	_, err := p.db.Transact(func(tr fdb.Transaction) (ret interface{}, e error) {
+		options := fdb.RangeOptions{Limit: 100, Reverse: reverse}
+		ss := tr.Snapshot()
 
-	//        tr = db.create_transaction()
-	//        r = self._pop_request.range()
-	//        requests = list(tr.snapshot.get_range(r.start, r.stop, limit=batch))
-	//        r = self._item.range()
-	//        items = tr.snapshot.get_range(
-	//            r.start, r.stop, limit=batch, reverse=max)
+		requests := ss.GetRange(keyRange(p.popRequest), options)
+		items := ss.GetRange(keyRange(p.item), options)
 
-	//        i = 0
-	//        for request, (item_key, item_value) in zip(requests, items):
-	//            random_ID = self._pop_request.unpack(request.key)[1]
-	//            tr[self._requested_item[random_ID]] = item_value
-	//            tr.add_read_conflict_key(item_key)
-	//            tr.add_read_conflict_key(request.key)
-	//            del tr[request.key]
-	//            del tr[item_key]
-	//            priority, count, _ = self._item.unpack(item_key)
-	//            del tr[self._member[item_value][priority][count]]
-	//            i += 1
+		reqSlice, err := requests.GetSliceWithError()
+		itemSlice, err2 := items.GetSliceWithError()
+		if err != nil {
+			return nil, err
+		}
+		if err2 != nil {
+			return nil, err2
+		}
 
-	//        for request in requests[i:]:
-	//            tr.add_read_conflict_key(request.key)
-	//            del tr[request.key]
+		for i := 0; i < len(reqSlice); i++ {
+			req := reqSlice[i]
+			item := itemSlice[i]
 
-	//        tr.commit().wait()
-	return nil
+			randomID, err := p.popRequest.Unpack(req.Key)
+			if err != nil {
+				return nil, err
+			}
+
+			tr.AddReadConflictKey(req.Key)
+			tr.Clear(req.Key)
+
+			if i >= len(itemSlice) {
+				// If there are more requests than items, we can delete requests
+				// that won't be fulfilled and keep running.
+				continue
+			}
+
+			subKey := p.popResult.Pack(randomID)
+			tr.Set(subKey, item.Value)
+
+			tr.AddReadConflictKey(item.Key)
+			tr.Clear(item.Key)
+
+			tpl, err := p.item.Unpack(item.Key)
+			if err != nil {
+				return nil, err
+			}
+			priority, count := tpl[0], tpl[1]
+			deleteKey := p.member.Pack([]tuple.TupleElement{item.Value, priority, count})
+			tr.Clear(deleteKey)
+		}
+		return
+	})
+	return err
 }
 
 // InterfaceToByteArray is a convenience wrapper used to convert
@@ -344,6 +389,11 @@ func mustByteWrapper(i interface{}, err error) []byte {
 		return nil
 	}
 	return ba
+}
+
+func keyRange(ss subspace.Subspace) fdb.KeyRange {
+	begin, end := ss.FDBRangeKeys()
+	return fdb.KeyRange{Begin: begin, End: end}
 }
 
 // Encode & decode may be useless

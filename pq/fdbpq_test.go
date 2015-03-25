@@ -14,7 +14,18 @@ import (
 
 var (
 	db fdb.Database
+	pq PriorityQueue
+
+	testByte1 = []byte("testtest")
+	testByte2 = []byte("testTEST")
 )
+
+func TestPush(t *testing.T) {
+	err := pq.Push(1, testByte)
+	if err != nil {
+		t.Error("Error pushing to PQ")
+	}
+}
 
 // func smokeTest(reverse bool) {
 // 	log.Println("Running smoke test:")
@@ -110,6 +121,7 @@ var (
 func TestMain(m *testing.M) {
 	fdb.MustAPIVersion(300)
 	db = fdb.MustOpenDefault()
+	pq = NewPriorityQueue(db, []string{"testing"}, true)
 
 	// smokeTest(false)
 	// smokeTest(true)
